@@ -4,6 +4,9 @@ import numpy as np
 import joblib
 import matplotlib.pyplot as plt
 import seaborn as sns
+import os
+import zipfile
+import urllib.request
 from pathlib import Path
 from tensorflow.keras.models import load_model
 from sklearn.decomposition import PCA
@@ -103,34 +106,189 @@ h1,h2,h3 {letter-spacing:-.3px;}
 """, unsafe_allow_html=True)
 
 # ============================================================
-# LOADERS
+# LOADERS & CONFIGURATION
 # ============================================================
-@st.cache_data
+def get_config_val(key: str, default: str | None = None) -> str | None:
+    """Retrieve configuration from Streamlit secrets or environment variables."""
+    try:
+        if key in st.secrets:
+            val = st.secrets[key]
+            if val is not None and str(val).strip():
+                return str(val).strip()
+    except Exception:
+        pass
+    env_val = os.environ.get(key)
+    if env_val is not None and env_val.strip():
+        return env_val.strip()
+    return default
+
+
+def download_dataset_from_url(url: str, dest_path: Path):
+    """Download dataset or model from a direct URL (supports CSV or ZIP)."""
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = dest_path.parent / f"{dest_path.name}.download_tmp"
+
+    download_url = url
+    if "drive.google.com" in download_url and "/file/d/" in download_url:
+        file_id = download_url.split("/file/d/")[1].split("/")[0]
+        download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    elif "dropbox.com" in download_url and download_url.endswith("dl=0"):
+        download_url = download_url[:-4] + "dl=1"
+
+    req = urllib.request.Request(
+        download_url,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    )
+    with urllib.request.urlopen(req, timeout=600) as response, open(temp_path, "wb") as out_file:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            out_file.write(chunk)
+
+    if zipfile.is_zipfile(temp_path):
+        with zipfile.ZipFile(temp_path, "r") as z:
+            csv_members = [m for m in z.namelist() if m.lower().endswith(".csv")]
+            if not csv_members:
+                temp_path.unlink(missing_ok=True)
+                raise ValueError("Downloaded zip archive does not contain any CSV files.")
+            chosen_csv = next((m for m in csv_members if "creditcard" in m.lower()), csv_members[0])
+            z.extract(chosen_csv, path=dest_path.parent)
+            extracted_path = dest_path.parent / chosen_csv
+            if extracted_path.resolve() != dest_path.resolve():
+                if dest_path.exists():
+                    dest_path.unlink()
+                extracted_path.rename(dest_path)
+        temp_path.unlink(missing_ok=True)
+    else:
+        if dest_path.exists():
+            dest_path.unlink()
+        temp_path.rename(dest_path)
+
+
+@st.cache_data(show_spinner="Loading dataset...")
 def load_dataset():
-    if not DATASET_PATH.exists():
-        raise FileNotFoundError(f"Dataset file missing: {DATASET_PATH}")
-    return pd.read_csv(DATASET_PATH)
+    configured_path = get_config_val("DATASET_PATH")
+    dataset_url = get_config_val("DATASET_URL")
+
+    # If an explicit DATASET_PATH was configured
+    if configured_path:
+        target_path = Path(configured_path)
+        if target_path.exists() and target_path.is_file() and target_path.stat().st_size > 0:
+            return pd.read_csv(target_path)
+        if dataset_url:
+            try:
+                download_dataset_from_url(dataset_url, target_path)
+                if target_path.exists() and target_path.stat().st_size > 0:
+                    return pd.read_csv(target_path)
+            except Exception as dl_err:
+                raise RuntimeError(
+                    f"Failed to download dataset from configured DATASET_URL to '{target_path}': {dl_err}"
+                )
+        raise FileNotFoundError(
+            f"Configured DATASET_PATH file missing: '{target_path}'.\n\n"
+            "Please ensure the path exists or provide DATASET_URL in Streamlit secrets."
+        )
+
+    # Default path
+    target_path = DATASET_PATH
+
+    # 1. Check if file exists at default location
+    if target_path.exists() and target_path.is_file() and target_path.stat().st_size > 0:
+        return pd.read_csv(target_path)
+
+    # 2. Check local fallback directories
+    local_fallbacks = [
+        BASE_DIR / "archive" / "creditcard.csv",
+        BASE_DIR / "creditcard.csv",
+    ]
+    for fallback in local_fallbacks:
+        if fallback.exists() and fallback.is_file() and fallback.stat().st_size > 0:
+            return pd.read_csv(fallback)
+
+    # 3. Check if local archive.zip exists
+    zip_path = BASE_DIR / "archive.zip"
+    if zip_path.exists() and zip_path.is_file():
+        try:
+            with zipfile.ZipFile(zip_path, "r") as z:
+                csv_members = [m for m in z.namelist() if m.lower().endswith("creditcard.csv")]
+                if csv_members:
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    z.extract(csv_members[0], path=target_path.parent)
+                    extracted = target_path.parent / csv_members[0]
+                    if extracted.resolve() != target_path.resolve():
+                        if target_path.exists():
+                            target_path.unlink()
+                        extracted.rename(target_path)
+                    if target_path.exists():
+                        return pd.read_csv(target_path)
+        except Exception:
+            pass
+
+    # 4. Check if DATASET_URL is configured in secrets or env
+    if dataset_url:
+        try:
+            download_dataset_from_url(dataset_url, target_path)
+            if target_path.exists() and target_path.stat().st_size > 0:
+                return pd.read_csv(target_path)
+        except Exception as dl_err:
+            raise RuntimeError(
+                f"Failed to download dataset from configured DATASET_URL: {dl_err}"
+            )
+
+    # 5. Dataset missing - raise clear, detailed error
+    raise FileNotFoundError(
+        f"Dataset file missing at '{target_path}'.\n\n"
+        "• The full dataset (~143.8 MB) is excluded from GitHub via .gitignore (GitHub file limit is 100 MB).\n"
+        "• For Streamlit Cloud: upload creditcard.csv to a cloud host (GitHub Releases, Hugging Face, AWS S3, Google Drive) "
+        "and configure DATASET_URL in App Settings -> Secrets.\n"
+        "• For local/mounted environments: configure DATASET_PATH in secrets/env or place creditcard.csv in dataset/."
+    )
 
 @st.cache_resource
 def load_models():
-    required = [IF_PATH, LOF_PATH, IF_THRESHOLD_PATH, AMOUNT_SCALER_PATH, TIME_SCALER_PATH]
+    # Required core models (tracked in Git, ~900 KB total)
+    required = [IF_PATH, IF_THRESHOLD_PATH, AMOUNT_SCALER_PATH, TIME_SCALER_PATH]
     missing = [p.name for p in required if not p.exists()]
     if missing:
         raise FileNotFoundError("Missing required model files: " + ", ".join(missing))
 
     isolation_forest = joblib.load(IF_PATH)
-    lof = joblib.load(LOF_PATH)
     if_threshold = float(np.asarray(joblib.load(IF_THRESHOLD_PATH)).reshape(-1)[0])
     amount_scaler = joblib.load(AMOUNT_SCALER_PATH)
     time_scaler = joblib.load(TIME_SCALER_PATH)
 
+    # Optional model: Local Outlier Factor (LOF) (~118 MB, untracked in Git)
+    lof = None
+    configured_lof_path = get_config_val("LOF_PATH")
+    target_lof_path = Path(configured_lof_path) if configured_lof_path else LOF_PATH
+    lof_url = get_config_val("LOF_URL")
+
+    if not target_lof_path.exists() and lof_url:
+        try:
+            download_dataset_from_url(lof_url, target_lof_path)
+        except Exception:
+            pass
+
+    if target_lof_path.exists():
+        try:
+            lof = joblib.load(target_lof_path)
+        except Exception:
+            lof = None
+
+    # Optional model: Autoencoder (tracked in Git, handled gracefully if unreadable)
     autoencoder = None
     ae_threshold = None
     if AE_PATH.exists() and AE_THRESHOLD_PATH.exists():
-        autoencoder = load_model(AE_PATH, compile=False)
-        ae_threshold = float(np.asarray(joblib.load(AE_THRESHOLD_PATH)).reshape(-1)[0])
+        try:
+            autoencoder = load_model(AE_PATH, compile=False)
+            ae_threshold = float(np.asarray(joblib.load(AE_THRESHOLD_PATH)).reshape(-1)[0])
+        except Exception:
+            autoencoder = None
+            ae_threshold = None
 
     return isolation_forest, lof, if_threshold, amount_scaler, time_scaler, autoencoder, ae_threshold
+
 
 def prepare_features(rows, amount_scaler, time_scaler):
     """Scale raw dataset rows in the same way as the notebooks."""
@@ -139,20 +297,25 @@ def prepare_features(rows, amount_scaler, time_scaler):
     frame["Time"] = time_scaler.transform(frame[["Time"]])
     return frame[FEATURE_ORDER].astype("float32")
 
+
 def ae_errors(model, features):
     reconstructed = model.predict(features, verbose=0)
     return np.mean(np.square(features.to_numpy() - reconstructed), axis=1)
 
+
 def score_models(features, isolation_forest, lof, if_threshold, autoencoder, ae_threshold):
     if_scores = -isolation_forest.decision_function(features)
     if_flags = if_scores >= if_threshold
-    lof_scores = -lof.decision_function(features)
-    lof_flags = lof.predict(features) == -1
+    lof_scores = lof_flags = None
+    if lof is not None:
+        lof_scores = -lof.decision_function(features)
+        lof_flags = lof.predict(features) == -1
     ae_scores = ae_flags = None
     if autoencoder is not None:
         ae_scores = ae_errors(autoencoder, features)
         ae_flags = ae_scores >= ae_threshold
     return if_scores, if_flags, lof_scores, lof_flags, ae_scores, ae_flags
+
 
 def metric_table(y_true, predictions):
     return {
@@ -161,11 +324,16 @@ def metric_table(y_true, predictions):
         "F1 score": f1_score(y_true, predictions, zero_division=0),
     }
 
+
 # ============================================================
 # INITIALIZE APP
 # ============================================================
 st.markdown('<div class="main-title">🛡️ Financial <span>AI</span> Command Center</div>', unsafe_allow_html=True)
 st.markdown('<div class="subtitle">SMARTER DETECTION&nbsp;&nbsp; | &nbsp;&nbsp; SAFER TRANSACTIONS&nbsp;&nbsp; | &nbsp;&nbsp; A SECURE FINANCIAL FUTURE</div>', unsafe_allow_html=True)
+
+df = None
+isolation_forest = lof = amount_scaler = time_scaler = autoencoder = None
+if_threshold = ae_threshold = None
 
 try:
     df = load_dataset()
@@ -173,7 +341,30 @@ try:
      autoencoder, ae_threshold) = load_models()
 except Exception as exc:
     st.error(f"Could not initialize dashboard: {exc}")
-    st.info("Confirm dataset/creditcard.csv and the trained files inside models/ are present.")
+    st.markdown("""
+    <div style="background:linear-gradient(145deg,#180c10,#0e080b);border:1px solid #7d1725;border-radius:12px;padding:20px;margin-top:14px;margin-bottom:14px;">
+        <h4 style="color:#ff6a78;margin-top:0;font-size:16px;">💡 How to Fix Missing Dataset on Streamlit Cloud</h4>
+        <p style="color:#c4ccd5;font-size:13px;line-height:1.6;">
+            The dataset is approximately 143.84 MB and is excluded from GitHub via <code>.gitignore</code> due to GitHub's 100 MB file limit.
+            Because of this, Streamlit Cloud cannot find the dataset file on initial deployment.
+        </p>
+        <div style="color:#eef3f7;font-size:13px;line-height:1.8;">
+            <b>Recommended Fix (Cloud):</b>
+            <ol style="margin-top:6px;padding-left:20px;">
+                <li>Upload <code>creditcard.csv</code> (or a <code>.zip</code> of it) to a cloud storage host such as <b>GitHub Releases</b>, <b>Hugging Face Datasets</b>, <b>AWS S3</b>, or <b>Google Drive</b>.</li>
+                <li>In your Streamlit Cloud app dashboard, go to <b>Settings → Secrets</b>.</li>
+                <li>Add your direct download URL:<br>
+                    <code style="background:#090e13;color:#ff6a78;padding:4px 8px;border-radius:6px;display:inline-block;margin:5px 0;">DATASET_URL = "https://your-storage-host.com/creditcard.csv"</code>
+                </li>
+                <li>Reboot the app. It will automatically download and cache the dataset.</li>
+            </ol>
+            <b>Local Development:</b> Place <code>creditcard.csv</code> inside the <code>dataset/</code> directory, or set <code>DATASET_PATH</code>.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.stop()
+
+if df is None:
     st.stop()
 
 with st.sidebar:
@@ -198,8 +389,8 @@ with st.sidebar:
     )
     st.divider()
     st.caption("Loaded models")
-    st.write("✅ Isolation Forest")
-    st.write("✅ Local Outlier Factor")
+    st.write("✅ Isolation Forest" if isolation_forest is not None else "⚠️ Isolation Forest unavailable")
+    st.write("✅ Local Outlier Factor" if lof is not None else "⚠️ LOF unavailable (118 MB not in Git)")
     st.write("✅ Autoencoder" if autoencoder is not None else "⚠️ Autoencoder files unavailable")
 
 # ============================================================
@@ -224,11 +415,13 @@ if page == "🏠 Overview":
     fraud_rate = (fraud_count / total_count * 100) if total_count else 0
     normal_rate = (normal_count / total_count * 100) if total_count else 0
     k1, k2, k3, k4 = st.columns(4)
+    num_models = int(isolation_forest is not None) + int(lof is not None) + int(autoencoder is not None)
+    active_models = [name for name, m in [("Isolation Forest", isolation_forest), ("LOF", lof), ("Autoencoder", autoencoder)] if m is not None]
     cards = [
         (k1, "TOTAL TRANSACTIONS", f"{total_count:,}", "Dataset records loaded", "▤"),
         (k2, "FRAUD-LABELLED", f"{fraud_count:,}", f"{fraud_rate:.3f}% of dataset", "⚠"),
         (k3, "NORMAL TRANSACTIONS", f"{normal_count:,}", f"{normal_rate:.2f}% of dataset", "⬡"),
-        (k4, "MODELS AVAILABLE", str(2 + int(autoencoder is not None)), "Isolation Forest · LOF · Autoencoder", "◉"),
+        (k4, "MODELS AVAILABLE", str(num_models), " · ".join(active_models) if active_models else "None", "◉"),
     ]
     for col, label, value, foot, icon in cards:
         with col:
@@ -247,7 +440,10 @@ if page == "🏠 Overview":
         st.markdown('</div>', unsafe_allow_html=True)
     with right:
         st.markdown('<div class="panel"><div class="panel-title">Model Status</div>', unsafe_allow_html=True)
-        st.markdown(f'<p>🟢 <b>Isolation Forest</b><br><span style="color:#8fa0ad;font-size:12px;">Threshold: {if_threshold:.5f}</span></p><p>🟢 <b>Local Outlier Factor</b></p><p>{"🟢" if autoencoder is not None else "🟠"} <b>Autoencoder</b><br><span style="color:#8fa0ad;font-size:12px;">{"Threshold: " + format(ae_threshold, ".5f") if ae_threshold is not None else "Model files unavailable"}</span></p>', unsafe_allow_html=True)
+        if_status = f'<p>🟢 <b>Isolation Forest</b><br><span style="color:#8fa0ad;font-size:12px;">Threshold: {if_threshold:.5f}</span></p>' if isolation_forest is not None else '<p>🟠 <b>Isolation Forest</b><br><span style="color:#8fa0ad;font-size:12px;">Model unavailable</span></p>'
+        lof_status = '<p>🟢 <b>Local Outlier Factor</b></p>' if lof is not None else '<p>🟠 <b>Local Outlier Factor</b><br><span style="color:#8fa0ad;font-size:12px;">Model file unavailable (118 MB not in Git)</span></p>'
+        ae_status = f'<p>{"🟢" if autoencoder is not None else "🟠"} <b>Autoencoder</b><br><span style="color:#8fa0ad;font-size:12px;">{"Threshold: " + format(ae_threshold, ".5f") if ae_threshold is not None else "Model files unavailable"}</span></p>'
+        st.markdown(f'{if_status}{lof_status}{ae_status}', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
     lower1, lower2 = st.columns([1.1, 1])
@@ -297,8 +493,11 @@ elif page == "🔍 Transaction Investigation":
             st.warning("Flagged anomaly" if if_f[0] else "Predicted normal")
         with cols[1]:
             st.markdown("#### LOF")
-            st.metric("Anomaly score", f"{lof_s[0]:.5f}")
-            st.warning("Flagged anomaly" if lof_f[0] else "Predicted normal")
+            if lof_s is None:
+                st.warning("Model file unavailable")
+            else:
+                st.metric("Anomaly score", f"{lof_s[0]:.5f}")
+                st.warning("Flagged anomaly" if lof_f[0] else "Predicted normal")
         with cols[2]:
             st.markdown("#### Autoencoder")
             if ae_s is None:
@@ -326,6 +525,8 @@ elif page == "🚨 Fraud Detection":
     model_choice = st.selectbox("Detection model", ["Autoencoder", "Isolation Forest", "Local Outlier Factor"])
     if model_choice == "Autoencoder" and autoencoder is None:
         st.warning("Autoencoder files are unavailable. Choose another model.")
+    elif model_choice == "Local Outlier Factor" and lof is None:
+        st.warning("Local Outlier Factor model file is unavailable. Choose another model.")
     elif st.button("Run fraud scan", type="primary"):
         sample = df.sample(n=int(sample_size), random_state=42).copy()
         Xs = prepare_features(sample, amount_scaler, time_scaler)
@@ -489,6 +690,8 @@ elif page == "🧠 AI Investigation Assistant":
     selected_model = st.selectbox("Model for investigation", ["Autoencoder", "Isolation Forest", "Local Outlier Factor"], key="assistant_model")
     if selected_model == "Autoencoder" and autoencoder is None:
         st.warning("Autoencoder files are unavailable. Select another model.")
+    elif selected_model == "Local Outlier Factor" and lof is None:
+        st.warning("Local Outlier Factor model file is unavailable. Select another model.")
     elif st.button("Generate investigation insights", type="primary"):
         if selected_model == "Autoencoder":
             score = float(ae_errors(autoencoder, features)[0]); threshold = float(ae_threshold); flagged = score >= threshold
@@ -556,10 +759,13 @@ elif page == "🛡️ Case Management":
                 st.error("Autoencoder is unavailable. Choose another model.")
                 st.stop()
             case_score = float(ae_errors(autoencoder, row_features)[0])
+        elif case_model == "Local Outlier Factor":
+            if lof is None:
+                st.error("Local Outlier Factor is unavailable. Choose another model.")
+                st.stop()
+            case_score = float(-lof.decision_function(row_features)[0])
         elif case_model == "Isolation Forest":
             case_score = float(-isolation_forest.decision_function(row_features)[0])
-        else:
-            case_score = float(-lof.decision_function(row_features)[0])
         new_id = f"FRD-{pd.Timestamp.now().strftime('%Y%m%d-%H%M%S')}"
         new_case = {"Case ID": new_id, "Transaction Row": int(case_row), "Model": case_model,
                     "Risk Score": case_score, "Status": case_status, "Notes": case_notes,
@@ -601,6 +807,8 @@ elif page == "⚡ Live-Style Monitor":
     replay_model = st.selectbox("Monitoring model", ["Autoencoder", "Isolation Forest", "Local Outlier Factor"], key="replay_model")
     if replay_model == "Autoencoder" and autoencoder is None:
         st.warning("Autoencoder files are unavailable. Choose another model.")
+    elif replay_model == "Local Outlier Factor" and lof is None:
+        st.warning("Local Outlier Factor model file is unavailable. Choose another model.")
     elif st.button("▶ Replay transaction batch", type="primary"):
         replay = df.sample(n=int(replay_count), random_state=None).copy()
         replay_x = prepare_features(replay, amount_scaler, time_scaler)
@@ -639,6 +847,8 @@ elif page == "📄 Investigation Report":
     report_model = st.selectbox("Model for report", ["Autoencoder", "Isolation Forest", "Local Outlier Factor"], key="report_model")
     if report_model == "Autoencoder" and autoencoder is None:
         st.warning("Autoencoder files are unavailable. Choose another model.")
+    elif report_model == "Local Outlier Factor" and lof is None:
+        st.warning("Local Outlier Factor model file is unavailable. Choose another model.")
     elif st.button("Prepare report", type="primary"):
         raw = df.iloc[[int(report_row)]]
         features = prepare_features(raw, amount_scaler, time_scaler)
