@@ -1,0 +1,9 @@
+streamlit==1.65.0
+pandas
+numpy
+scikit-learn==1.7.2
+scipy
+matplotlib
+seaborn
+joblib
+tensorflow==2.21.0

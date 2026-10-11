@@ -1,0 +1,2 @@
+Model,Threshold,Precision,Recall,F1,True_Negative,False_Positive,False_Negative,True_Positive
+Autoencoder,2.0837817811965933,0.18369690011481057,0.6504065040650406,0.2864816472694718,282893,1422,172,320
